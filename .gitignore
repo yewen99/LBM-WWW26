@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pt
+*.pth
+*.egg-info/
+wandb/
+ckpt/
+*.log
+events.out.tfevents.*
