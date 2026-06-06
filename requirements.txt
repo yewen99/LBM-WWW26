@@ -1,0 +1,26 @@
+# Core deep learning stack
+torch>=2.0
+transformers>=4.40
+numpy
+pandas
+scipy
+
+# Logging / training utilities
+tensorboard
+wandb
+tqdm
+matplotlib
+ipython
+
+# Datasets / data formats
+datasets
+pyarrow
+
+# LLM serving / inference (used by GQPO data generation and evaluation)
+vllm>=0.6.3
+
+# LBM-Think SFT (LLaMA-Factory subset is bundled in lbm_think/src)
+peft
+accelerate
+trl
+sentencepiece

@@ -1,149 +1,170 @@
-import re
-import os
-from datasets import Dataset, load_dataset
-from random import randint, seed, choice
-from typing import List, Tuple
-from tqdm import tqdm
+"""Generate GQPO prompt data from preprocessed AuctionNet trajectories."""
+
+from __future__ import annotations
+
 import argparse
-import numpy as np
+import os
 import random
+import sys
+from typing import List
 
-def make_prefix_bid(example, template_type):
-    history_info = example["history_info"]
-    budget = example["budget"]
-    CPA = example["CPA"]
-    expected_rtg = example["expected_rtg"]
-    current_s = example["current_s"]
-    current_won_conversions = example["current_won_conversions"]
-    if template_type == 'qwen-instruct':
-        """This works for bidding-r1 based on Qwen Instruct Models"""
-        import bidding_template
-        prefix = bidding_template.build_promt(history_info, current_s, budget, CPA, expected_rtg, current_won_conversions)
-    
-    return prefix
+import numpy as np
+from datasets import Dataset
+from tqdm import tqdm
 
-def discount_cumsum(x, gamma=1.):
-    discount_cumsum = np.zeros_like(x)
-    discount_cumsum[-1] = x[-1]
+
+# Allow running the script directly from the repo root.
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+if _THIS_DIR not in sys.path:
+    sys.path.insert(0, _THIS_DIR)
+
+from bidding_template import build_promt  # noqa: E402  (intentional spelling kept for compat)
+
+
+# Filtering thresholds — see :func:`filter_trajs`.
+DEFAULT_BUDGET_LEFT_RATIO = 0.05
+DEFAULT_USED_UP_STEPS = 24
+EXPERT_KEEP_PROB = 0.15      # keep ~15% of "good" trajectories
+NON_EXPERT_KEEP_PROB = 0.02  # keep ~2% of the rest
+
+
+def make_prefix_bid(example: dict, template_type: str) -> str:
+    """Build the user prompt prefix for a single example."""
+    if template_type != "qwen-instruct":
+        raise ValueError(f"Unsupported template_type: {template_type}")
+    return build_promt(
+        example["history_info"],
+        example["current_s"],
+        example["budget"],
+        example["CPA"],
+        example["expected_rtg"],
+        example["current_won_conversions"],
+    )
+
+
+def discount_cumsum(x: np.ndarray, gamma: float = 1.0) -> np.ndarray:
+    out = np.zeros_like(x)
+    out[-1] = x[-1]
     for t in reversed(range(x.shape[0] - 1)):
-        discount_cumsum[t] = x[t] + gamma * discount_cumsum[t + 1]
-    return discount_cumsum
-
-def remove_a0_trajs(trajectories):
-    # 先过滤一遍初始动作为0或1的垃圾轨迹
-    filtered_trajs = []
-    for traj in trajectories:
-        if traj['actions'][0] > 2:
-            filtered_trajs.append(traj)
-    trajectories = filtered_trajs  
-
-    return trajectories
+        out[t] = x[t] + gamma * out[t + 1]
+    return out
 
 
-def filter_trajs(trajectories, budget_left_ratio=0.05, cpa_down_ratio=0.7, cpa_up_ratio=1.3, used_up_step=24, rtg_scale=2000):
+def remove_a0_trajs(trajectories: List[dict], min_initial_action: float = 2.0) -> List[dict]:
+    """Drop trajectories whose initial action is degenerate (e.g. 0 or 1)."""
+    return [t for t in trajectories if t["actions"][0] > min_initial_action]
+
+
+def filter_trajs(
+    trajectories: List[dict],
+    *,
+    budget_left_ratio: float = DEFAULT_BUDGET_LEFT_RATIO,
+    used_up_step: int = DEFAULT_USED_UP_STEPS,
+    expert_keep_prob: float = EXPERT_KEEP_PROB,
+    non_expert_keep_prob: float = NON_EXPERT_KEEP_PROB,
+) -> List[dict]:
+    """Return a balanced subset of trajectories.
+
+    A trajectory is considered *expert* when:
+    1. its terminal budget-remaining ratio is below ``budget_left_ratio``,
+    2. its realised CPA ratio is below 1.0, and
+    3. it spent the budget over more than ``used_up_step`` steps.
     """
-        筛选出符合以下条件的轨迹：
-        优质轨迹占50% (调价的groundtruth方向为数据集方向), 其余轨迹占50%
-        
-        优质轨迹判断条件:
-        1) 剩余预算比例 < budget_left_ratio  
-        2) CPA_ratio < 1.0
-        3) 花完钱的步数 > used_up_step
-    """
+    trajectories = [t for t in trajectories if t["observations"].shape[0] > 2]
 
-    # 先过滤一遍太短的垃圾轨迹
-    filtered_trajs = []
+    expert_count, other_count = 0, 0
+    kept: List[dict] = []
+
     for traj in trajectories:
-        if traj["observations"].shape[0] > 2:
-            filtered_trajs.append(traj)
-    trajectories = filtered_trajs  
+        real_budget = traj["budget"]
+        budget_left = traj["observations"][-1][1]
+        total_reward = float(np.sum(traj["rewards"]))
+        cpa_ratio = ((1 - budget_left) * real_budget / max(total_reward, 1e-10)) / traj["cpa_constrain"]
+        used_up_steps = len(traj["dones"])
 
-    cnt_good, cnt_over_cpa, cnt_low_cost, cnt_bad = 0, 0, 0, 0
-    filtered_trajs = []
-    for traj in trajectories:
-        real_budget = traj['budget']
-        real_budget_left_ratio = traj['observations'][-1][1]
-        real_total_reward = sum(traj['rewards'])
-        real_cpa_ratio =  ((1-real_budget_left_ratio)*real_budget / real_total_reward) / traj['cpa_constrain']
-        real_used_up_steps = len(traj['dones'])
+        is_expert = (
+            budget_left < budget_left_ratio
+            and cpa_ratio < 1.0
+            and used_up_steps > used_up_step
+        )
 
-        # 优质轨迹
-        if real_budget_left_ratio < budget_left_ratio and real_cpa_ratio < 1.0 and real_used_up_steps > used_up_step:
-            if np.random.rand() > 0.85:
-                traj["is_expert_data"] = True
-                cnt_good += 1
-                filtered_trajs.append(traj)
+        keep_prob = expert_keep_prob if is_expert else non_expert_keep_prob
+        if np.random.rand() < keep_prob:
+            traj["is_expert_data"] = is_expert
+            kept.append(traj)
+            if is_expert:
+                expert_count += 1
+            else:
+                other_count += 1
 
-        # 其余随机
-        else:
-            if np.random.rand() > 0.98:
-                traj["is_expert_data"] = False
-                filtered_trajs.append(traj)
-                cnt_bad += 1
-
-    print(f'{cnt_good=} {cnt_bad=} ') 
-    return filtered_trajs
+    print(f"[filter_trajs] expert={expert_count}  other={other_count}  total={len(kept)}")
+    return kept
 
 
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--local_dir', default='/jiangnan/liyewen/r1/data/AuctionNet')
-    parser.add_argument('--save_dir', default='/jiangnan/liyewen/r1/data/AuctionNet/Expert_prompt/')
-    parser.add_argument('--K', type=int, default=1, help='the sequence length of the history information')
-    parser.add_argument('--repeat_sample_time', type=int, default=1, help='randomly generate data for how many times')
-    parser.add_argument('--hdfs_dir', default=None)
-    parser.add_argument('--train_dataset_ratio', type=int, default=0.90)
-    parser.add_argument('--test_size', type=int, default=1024)  # unused
-    parser.add_argument('--template_type', type=str, default='qwen-instruct')
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Generate GQPO prompt parquet data.")
+    parser.add_argument("--local_dir", required=True, help="directory containing the preprocessed AuctionNet shards")
+    parser.add_argument("--save_dir", required=True, help="directory to write train.parquet / test.parquet to")
+    parser.add_argument("--K", type=int, default=1, help="length of the historical window in each prompt")
+    parser.add_argument("--repeat_sample_time", type=int, default=1, help="number of resampling passes over the data")
+    parser.add_argument("--train_dataset_ratio", type=float, default=0.90, help="fraction of samples used for training")
+    parser.add_argument("--template_type", default="qwen-instruct", help="prompt template variant")
+    parser.add_argument("--sparse_data", action="store_true", help="use AuctionNet-sparse trajectories")
+    parser.add_argument("--seed", type=int, default=0, help="random seed")
+    return parser.parse_args()
 
-    args = parser.parse_args()
 
-    data_source = 'bidding'
-    
-    final_stage = False
-    if final_stage:
-        traj_0 = np.load('data/AuctionNet/final/preprocessed_trajectory_data_final_1.npy', allow_pickle=True).tolist()
-        traj_1 = np.load('data/AuctionNet/final/preprocessed_trajectory_data_final_2.npy', allow_pickle=True).tolist()
-        traj_2 = np.load('data/AuctionNet/final/preprocessed_trajectory_data_final_3.npy', allow_pickle=True).tolist()
-    else:
-        traj_0 = np.load(os.path.join(args.local_dir, 'preprocessed_trajectory_data_0.npy'), allow_pickle=True).tolist()
-        traj_1 = np.load(os.path.join(args.local_dir, 'preprocessed_trajectory_data_1.npy'), allow_pickle=True).tolist()
-        traj_2 = np.load(os.path.join(args.local_dir, 'preprocessed_trajectory_data_2.npy'), allow_pickle=True).tolist()
+def _load_trajectories(local_dir: str, sparse: bool) -> List[dict]:
+    from lbm_act.seq_dataset import DENSE_TRAJ_FILES, SPARSE_TRAJ_FILES
 
-    trajectories = traj_0 + traj_1 + traj_2
+    files = SPARSE_TRAJ_FILES if sparse else DENSE_TRAJ_FILES
+    trajs: List[dict] = []
+    for fname in files:
+        path = os.path.join(local_dir, fname)
+        trajs.extend(np.load(path, allow_pickle=True).tolist())
+    return trajs
+
+
+def main() -> None:
+    args = parse_args()
+    np.random.seed(args.seed)
+    random.seed(args.seed)
+    os.makedirs(args.save_dir, exist_ok=True)
+
+    trajectories = _load_trajectories(args.local_dir, args.sparse_data)
     trajectories = filter_trajs(trajectories)
-    # trajectories = trajectories[:100]
-    data_dict = {
-        'history_info': [],
-        'current_s': [],
-        'budget': [],
-        'expected_rtg': [],
-        'CPA': [],
-        'current_won_conversions': [],
-        'target_a': [],
-        'cpa_ratio': []
+
+    data_dict: dict[str, list] = {
+        "history_info": [], "current_s": [], "budget": [], "expected_rtg": [],
+        "CPA": [], "current_won_conversions": [], "target_a": [], "cpa_ratio": [],
     }
 
-    for _ in tqdm(range(args.repeat_sample_time), desc="Repeating sampling Progress"):
-        for i in tqdm(range(len(trajectories)), desc="Inner Loop Progress for Iterating All Data", leave=False):
-            seq_len = len(trajectories[i]["actions"])
+    for _ in tqdm(range(args.repeat_sample_time), desc="resampling"):
+        for traj in tqdm(trajectories, desc="trajectories", leave=False):
+            seq_len = len(traj["actions"])
             if seq_len <= 2:
                 continue
             K = args.K
-            start_t = random.randint(0, np.max((1, seq_len - 1 - K)))
-            cur_step = np.min((seq_len-1, start_t + K))
-            history_info = {"state":[], 
-                            "action": [], 
-                            "reward": []}
-            history_info["state"].append(np.round(trajectories[i]["observations"][start_t:cur_step], 3))
-            history_info["action"].append(np.round(trajectories[i]["actions"][start_t:cur_step], 3))
-            history_info["reward"].append(np.round(trajectories[i]["rewards"][start_t:cur_step], 3))
+            start_t = random.randint(0, max(1, seq_len - 1 - K))
+            cur_step = min(seq_len - 1, start_t + K)
 
-            current_s = np.round(trajectories[i]["observations"][cur_step], 3)
-            budget = trajectories[i]["budget"]
-            expected_rtg = discount_cumsum(trajectories[i]['rewards'][cur_step:], gamma=1.)[0]
-            cpa = trajectories[i]["cpa_constrain"]
-            target_a = trajectories[i]["actions"][cur_step]
+            history_info = {
+                "state": [np.round(traj["observations"][start_t:cur_step], 3)],
+                "action": [np.round(traj["actions"][start_t:cur_step], 3)],
+                "reward": [np.round(traj["rewards"][start_t:cur_step], 3)],
+            }
+
+            current_s = np.round(traj["observations"][cur_step], 3)
+            budget = traj["budget"]
+            expected_rtg = discount_cumsum(traj["rewards"][cur_step:], gamma=1.0)[0]
+            cpa = traj["cpa_constrain"]
+            target_a = traj["actions"][cur_step]
+
+            current_spent_budget = budget * (1.0 - current_s[1])
+            current_won_values = discount_cumsum(traj["rewards"][:cur_step], gamma=1.0)[0]
+            current_cpa = current_spent_budget / (current_won_values + 1e-6)
+            cpa_ratio = float(current_cpa) / cpa
+            assert cpa_ratio >= 0, f"negative CPA ratio: {current_cpa=} {cpa=}"
 
             data_dict["history_info"].append(history_info)
             data_dict["current_s"].append(current_s)
@@ -151,53 +172,35 @@ if __name__ == '__main__':
             data_dict["expected_rtg"].append(expected_rtg)
             data_dict["CPA"].append(cpa)
             data_dict["target_a"].append(target_a)
-
-            current_spent_budget = budget * (1. - current_s[1])
-            current_won_values = discount_cumsum(trajectories[i]['rewards'][:cur_step], gamma=1.)[0]
-            current_cpa = current_spent_budget / (current_won_values + 1e-6)
-            cpa_ratio = current_cpa.item() / cpa
-            assert cpa_ratio >=0, f"error in calculating cpa_ratio: {current_cpa=} {cpa=} {current_spent_budget=} {current_won_values=}"
             data_dict["cpa_ratio"].append(cpa_ratio)
-            data_dict['current_won_conversions'].append(current_won_values)
+            data_dict["current_won_conversions"].append(current_won_values)
 
+    raw = Dataset.from_dict(data_dict, split="train")
+    train_size = int(args.train_dataset_ratio * len(raw))
+    train = raw.select(range(train_size))
+    test = raw.select(range(train_size, len(raw) - 1))
 
-
-    raw_dataset = Dataset.from_dict(data_dict, split='train')
-    TRAIN_SIZE = int(args.train_dataset_ratio * len(raw_dataset))
-    train_dataset = raw_dataset.select(range(TRAIN_SIZE))
-    test_dataset = raw_dataset.select(range(TRAIN_SIZE, len(raw_dataset) - 1))
-
-    def make_map_fn(split):
-        def process_fn(example, idx):
-            question = make_prefix_bid(example, template_type=args.template_type)
-            solution = {
-                "target": example['target_a'],
-                "cpa_ratio": example['cpa_ratio'],
-            }
-            data = {
-                "data_source": data_source,
-                "prompt": [{
-                    "role": "user",
-                    "content": question,
-                }],
+    def _process(split: str):
+        def _fn(example, idx):
+            return {
+                "data_source": "bidding",
+                "prompt": [{"role": "user", "content": make_prefix_bid(example, args.template_type)}],
                 "ability": "math",
                 "reward_model": {
                     "style": "rule",
-                    "ground_truth": solution
+                    "ground_truth": {"target": example["target_a"], "cpa_ratio": example["cpa_ratio"]},
                 },
-                "extra_info": {
-                    'split': split,
-                    'index': idx,
-                }
+                "extra_info": {"split": split, "index": idx},
             }
-            return data
-        return process_fn
-    
-    train_dataset = train_dataset.map(function=make_map_fn('train'), with_indices=True)
-    test_dataset = test_dataset.map(function=make_map_fn('test'), with_indices=True)
+        return _fn
 
-    save_dir = args.save_dir
+    train = train.map(function=_process("train"), with_indices=True)
+    test = test.map(function=_process("test"), with_indices=True)
 
-    train_dataset.to_parquet(os.path.join(save_dir, 'train.parquet'))
-    test_dataset.to_parquet(os.path.join(save_dir, 'test.parquet'))
+    train.to_parquet(os.path.join(args.save_dir, "train.parquet"))
+    test.to_parquet(os.path.join(args.save_dir, "test.parquet"))
+    print(f"[gen_prompt_data] wrote train ({len(train)}) and test ({len(test)}) to {args.save_dir}")
 
+
+if __name__ == "__main__":
+    main()

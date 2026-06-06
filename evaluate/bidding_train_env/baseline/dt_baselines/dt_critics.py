@@ -531,7 +531,8 @@ def Q_voting(action_proposals, RSA_sequence, Q_ensemble):
     action_values = []
     for action in action_proposals:
         voting_value = []
-        # 重新组织 Rtg-State-Action 序列，即把最后一个位置的action换成当前action_proposal
+        # Re-build the Rtg-State-Action sequence, replacing the last action
+        # with the current proposal so that the Q-net scores it in context.
         states, actions, returns_to_go, timesteps, attention_mask = RSA_sequence
         actions[:, -1] = action
 

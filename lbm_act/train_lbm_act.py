@@ -1,106 +1,145 @@
-import os
+"""Training entrypoint for LBM-Act.
+
+Example
+-------
+::
+
+    python -m lbm_act.train_lbm_act \\
+        --data_path /path/to/preprocessed/data \\
+        --outputs_path ./ckpt \\
+        --sparse_data
+"""
+
+from __future__ import annotations
+
 import argparse
-import torch
-from transformers import AutoTokenizer
-os.environ["TOKENIZERS_PARALLELISM"] = "true"
-torch.set_default_dtype(torch.float32)
-from datetime import datetime
-from torch.utils.tensorboard import SummaryWriter
-from lbm_act.utils import set_seed, get_prompts
-from lbm_act.seq_dataset import EpisodeReplayBuffer
-from torch.utils.data import DataLoader, WeightedRandomSampler
-from lbm_act.llm_nets import BiddingModelConfig, LLMPolicy
-from lbm_act.algo import LBM_ACT_LEARNER
-from tqdm import tqdm
-import wandb
+import os
 import sys
+from datetime import datetime
 
-set_seed(0)
+import torch
+from torch.utils.data import DataLoader, WeightedRandomSampler
+from torch.utils.tensorboard import SummaryWriter
+from tqdm import tqdm
+from transformers import AutoTokenizer
 
-argp = argparse.ArgumentParser()
-argp.add_argument('--outputs_path', default="./ckpt", help='save model checkpoint directory')
-argp.add_argument('--data_path', default="./data", help='path to the preprocessed trajectory data directory')
-argp.add_argument('--resume_from_pretrain', default=False, help='whether loading a pretrained model')
-argp.add_argument('--pretrain_model_path', default="", help='path to pretrained model checkpoint')
-argp.add_argument('--sparse_data', action='store_true', help='whether use auctionNet-sparse')
-argp.add_argument('--batch_size', type=int, default=64, help='training batch size')
-argp.add_argument('--step_num', type=int, default=100000, help='total training steps')
-argp.add_argument('--lr', type=float, default=5e-6, help='learning rate')
-argp.add_argument('--log_every_step', type=int, default=100, help='logging interval')
-argp.add_argument('--save_every_step', type=int, default=10000, help='checkpoint saving interval')
-argp.add_argument('--debug', type=bool, default=True, help='disable wandb logging')
-args = argp.parse_args()
-
-if not args.debug:
-    wandb.init(project='llm+mlp')
-
-# ---------------------------- Setup the Model and Learner ---------------------------- #
-mconf = BiddingModelConfig()
-
-model = LLMPolicy(mconf)
-tokenizer = AutoTokenizer.from_pretrained(mconf.model_name)
-
-now = datetime.now()
-timestamp = now.strftime("%Y-%m-%d/%H-%M-%S")
-ckpt_path = os.path.join(os.path.join(args.outputs_path, f"{timestamp}"), mconf.model_name)
-os.makedirs(ckpt_path, exist_ok=True)
-print(f'{ckpt_path=}', flush=True)
-writer = SummaryWriter(log_dir=ckpt_path)
-
-lbm_act_learner = LBM_ACT_LEARNER(
-    policy=model,
-    tokenizer=tokenizer,
-    optimizer_factory=lambda params: torch.optim.Adam(params, lr=args.lr),
-    max_steps=args.step_num,
-    tau=0.9,
-    beta=3.,
-    alpha=0.005,
-    discount=0.99
-)
-
-if args.resume_from_pretrain:
-    checkpoint = torch.load(args.pretrain_model_path)
-    lbm_act_learner.load_state_dict(checkpoint)
-    print(f'loaded pretrained model from {args.pretrain_model_path}')
+from lbm_act.algo import LbmActLearner
+from lbm_act.llm_nets import BiddingModelConfig, LLMPolicy
+from lbm_act.seq_dataset import EpisodeReplayBuffer
+from lbm_act.utils import set_seed
 
 
-# -------------------------------------- Dataset -------------------------------------- #
-if args.sparse_data:
-    rtg_scale = 100.
-else:
-    rtg_scale = 1500
-
-replay_buffer = EpisodeReplayBuffer(state_dim=16, act_dim=1, K=10, data_path=args.data_path, load_preprocessed_data=True, scale=rtg_scale, final_stage=args.sparse_data)
-sampler = WeightedRandomSampler(replay_buffer.p_sample, num_samples=args.step_num * args.batch_size, replacement=True)
-train_dataloader = DataLoader(replay_buffer, sampler=sampler, batch_size=args.batch_size)
+# RTG normalisation scale; the dense and sparse AuctionNet datasets have very
+# different reward magnitudes, so each ships with its own scale.
+RTG_SCALE_DENSE = 1500.0
+RTG_SCALE_SPARSE = 100.0
+# Action clipping used as a soft outlier removal during training.
+ACTION_CLIP_DENSE = 54.0
+ACTION_CLIP_SPARSE = 500.0
 
 
-# -------------------------------------- Train -------------------------------------- # 
-disable_tqdm = not sys.stdout.isatty()
-with tqdm(train_dataloader, desc=f"Training", disable=disable_tqdm) as pbar:
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Train the LBM-Act policy.")
+    parser.add_argument("--outputs_path", default="./ckpt", help="checkpoint output directory")
+    parser.add_argument("--data_path", required=True, help="path to the preprocessed trajectory data directory")
+    parser.add_argument("--resume_from_pretrain", action="store_true", help="load a previously saved learner state dict")
+    parser.add_argument("--pretrain_model_path", default="", help="path to the pretrained learner state dict")
+    parser.add_argument("--sparse_data", action="store_true", help="use AuctionNet-sparse instead of AuctionNet-dense")
+    parser.add_argument("--batch_size", type=int, default=64, help="training batch size")
+    parser.add_argument("--step_num", type=int, default=100_000, help="total number of optimisation steps")
+    parser.add_argument("--lr", type=float, default=5e-6, help="learning rate")
+    parser.add_argument("--seq_len", type=int, default=10, help="sequence length K of the DT-style window")
+    parser.add_argument("--state_dim", type=int, default=16, help="environment state dimension")
+    parser.add_argument("--log_every_step", type=int, default=100, help="logging interval")
+    parser.add_argument("--save_every_step", type=int, default=10_000, help="checkpoint saving interval")
+    parser.add_argument("--seed", type=int, default=0, help="random seed")
+    parser.add_argument("--use_wandb", action="store_true", help="enable Weights & Biases logging")
+    parser.add_argument("--wandb_project", default="lbm-act", help="W&B project name")
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    set_seed(args.seed)
+    os.environ.setdefault("TOKENIZERS_PARALLELISM", "true")
+    torch.set_default_dtype(torch.float32)
+
+    if args.use_wandb:
+        import wandb  # local import: optional dependency
+
+        wandb.init(project=args.wandb_project, config=vars(args))
+
+    # ------------------------- Model & learner ------------------------- #
+    mconf = BiddingModelConfig(input_state_dim=args.state_dim)
+    model = LLMPolicy(mconf)
+    tokenizer = AutoTokenizer.from_pretrained(mconf.model_name)
+
+    timestamp = datetime.now().strftime("%Y-%m-%d/%H-%M-%S")
+    ckpt_path = os.path.join(args.outputs_path, timestamp, mconf.model_name)
+    os.makedirs(ckpt_path, exist_ok=True)
+    print(f"[train] checkpoint path: {ckpt_path}", flush=True)
+
+    writer = SummaryWriter(log_dir=ckpt_path)
+
+    learner = LbmActLearner(
+        policy=model,
+        tokenizer=tokenizer,
+        optimizer_factory=lambda params: torch.optim.Adam(params, lr=args.lr),
+        max_steps=args.step_num,
+    )
+
+    if args.resume_from_pretrain:
+        if not args.pretrain_model_path:
+            raise ValueError("--pretrain_model_path must be set when --resume_from_pretrain is given")
+        learner.load_state_dict(torch.load(args.pretrain_model_path))
+        print(f"[train] loaded pretrained checkpoint from {args.pretrain_model_path}")
+
+    # ----------------------------- Dataset ----------------------------- #
+    rtg_scale = RTG_SCALE_SPARSE if args.sparse_data else RTG_SCALE_DENSE
+    action_clip = ACTION_CLIP_SPARSE if args.sparse_data else ACTION_CLIP_DENSE
+
+    replay_buffer = EpisodeReplayBuffer(
+        state_dim=args.state_dim,
+        act_dim=1,
+        K=args.seq_len,
+        data_path=args.data_path,
+        load_preprocessed_data=True,
+        scale=rtg_scale,
+        sparse_data=args.sparse_data,
+    )
+    sampler = WeightedRandomSampler(
+        replay_buffer.p_sample, num_samples=args.step_num * args.batch_size, replacement=True,
+    )
+    dataloader = DataLoader(replay_buffer, sampler=sampler, batch_size=args.batch_size)
+
+    # ------------------------------ Train ------------------------------ #
+    disable_tqdm = not sys.stdout.isatty()
     total_loss = 0.0
-    for step, batch in enumerate(pbar):
-        states, actions, rewards, dones, rtgs, timesteps, attention_masks, budgets, cpas, costs = batch
+    with tqdm(dataloader, desc="Training", disable=disable_tqdm) as pbar:
+        for step, batch in enumerate(pbar):
+            states, actions, _rewards, _dones, rtgs, timesteps, attention_masks, *_ = batch
+            actions = torch.clamp(actions, max=action_clip)
 
-        if args.sparse_data:
-            actions = torch.clamp(actions, max=500.0)
-        else:
-            actions = torch.clamp(actions, max=54.0)
-            
-        policy_loss = lbm_act_learner.update_policy_Text_RSA_emb(states, actions, rtgs[:, :-1], timesteps, attention_masks)  # <----- LBM_ACT
-        
-        total_loss += policy_loss
+            loss = learner.update(states, actions, rtgs[:, :-1], timesteps, attention_masks)
+            total_loss += loss
 
-        if (step + 1) % args.log_every_step == 0:
-            average_loss = total_loss / args.log_every_step
-            print(f"Average loss at step {step + 1}: {average_loss}", flush=True)
-            if not args.debug:
-                wandb.log({'Average Loss': average_loss}, step=step + 1)
-            writer.add_scalar('train/loss', average_loss, step + 1)
-            total_loss = 0.0
+            if (step + 1) % args.log_every_step == 0:
+                avg_loss = total_loss / args.log_every_step
+                print(f"[train] step {step + 1}: avg loss = {avg_loss:.6f}", flush=True)
+                writer.add_scalar("train/loss", avg_loss, step + 1)
+                if args.use_wandb:
+                    import wandb
+                    wandb.log({"avg_loss": avg_loss}, step=step + 1)
+                total_loss = 0.0
 
-        if step % args.save_every_step == 0:
-            torch.save(lbm_act_learner.state_dict(), os.path.join(ckpt_path, 'final.pt'))
+            if step % args.save_every_step == 0:
+                torch.save(learner.state_dict(), os.path.join(ckpt_path, "final.pt"))
 
-if not args.debug:
-    wandb.finish()
+    torch.save(learner.state_dict(), os.path.join(ckpt_path, "final.pt"))
+    if args.use_wandb:
+        import wandb
+        wandb.finish()
+
+
+if __name__ == "__main__":
+    main()

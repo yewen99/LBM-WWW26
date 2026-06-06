@@ -1,224 +1,237 @@
-import torch
-import torch.nn as nn
-from lbm_act.utils import mlp
-from transformers import AutoModel, AutoTokenizer, PreTrainedModel, PretrainedConfig, Qwen2Config, AutoModelForCausalLM
+"""LLM-based policy network for LBM-Act.
+
+The model takes a Decision-Transformer–style ``(R, S, A)`` sequence together
+with a textual high-level guide (CoT) and predicts the next bidding
+parameter. It builds on top of a frozen Qwen2.5 backbone.
+"""
+
+from __future__ import annotations
+
 import logging
-import os
+from typing import Optional
+
 import numpy as np
-import random
+import torch
+from torch import nn
+from transformers import AutoModel, PreTrainedModel, Qwen2Config
+
+from lbm_act.utils import mlp
+
 
 logger = logging.getLogger(__name__)
-torch.manual_seed(42)
 
-LOG_STD_MIN = -5.0
-LOG_STD_MAX = 2.0
 
-def ks_mlp(input_size, hidden_size, output_size=1, output_activation=nn.Identity(), hidden_activation=nn.ELU()):
-    sizes = [input_size] + list(hidden_size) + [output_size]
-    layers = []
-    for i in range(len(sizes) - 1):
-        act = hidden_activation if i < len(sizes) - 2 else output_activation
-        layers += [nn.Linear(sizes[i], sizes[i + 1]), act]
-    return nn.Sequential(*layers)
+# Padding value for missing actions in the trajectory; consistent with the
+# replay buffer in :mod:`lbm_act.seq_dataset`.
+ACTION_PADDING_VALUE = -10.0
+
+
+def _build_mlp(input_size: int, hidden_size: int, output_size: int = 1) -> nn.Sequential:
+    """Convenience: 4-layer MLP used to project tokens into the LLM hidden space."""
+    return mlp(
+        [input_size, hidden_size, hidden_size, hidden_size, output_size],
+        activation=nn.ReLU,
+        output_activation=None,
+    )
 
 
 class BiddingModelConfig(Qwen2Config):
+    """Configuration for :class:`LLMPolicy`."""
 
-    model_name = "Qwen/Qwen2.5-0.5B-Instruct"
-    output_hidden_states = True
+    model_name: str = "Qwen/Qwen2.5-0.5B-Instruct"
+    output_hidden_states: bool = True
 
-    output_head_size = 1
-    output_head_hidden_activation = nn.ReLU()
-    output_head_dropout_ratio = 0.0
+    input_state_dim: int = 16
+    rtg_scale: float = 2000.0
+    state_mean: float | np.ndarray = 0.0
+    state_std: float | np.ndarray = 1.0
 
-    input_state_dim = 16
-    rtg_scale = 2000
-    state_mean = 0.
-    state_std = 1.
+    # DT-style hyper-parameters
+    max_ep_len: int = 48
+    horizon: int = 10
+    time_dim: int = 8
+    action_dim: int = 1
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        for k,v in kwargs.items():
+        for k, v in kwargs.items():
             setattr(self, k, v)
 
 
 class LLMPolicy(PreTrainedModel):
+    """Policy network: ``(text guide, R, S, A) -> action``."""
+
     config_class = BiddingModelConfig
-    
-    def __init__(self, config):
+
+    def __init__(self, config: BiddingModelConfig):
         super().__init__(config)
-        self.model = AutoModel.from_pretrained(config.model_name, output_hidden_states=config.output_hidden_states) 
+        self.model = AutoModel.from_pretrained(
+            config.model_name,
+            output_hidden_states=config.output_hidden_states,
+        )
         hidden_size = self.model.config.hidden_size
         self.hidden_size = hidden_size
-        print("Base model hidden size: ", hidden_size)
 
-        self.output_heads = nn.ModuleDict()
-        self.output_heads["output_head3"] = ks_mlp(input_size=hidden_size, 
-                               hidden_size=[hidden_size, hidden_size, hidden_size], 
-                               output_size=1, 
-                               output_activation=nn.Identity(), 
-                               hidden_activation=nn.ReLU())
+        # Output head: hidden -> action
+        self.output_head = mlp(
+            [hidden_size, hidden_size, hidden_size, hidden_size, 1],
+            activation=nn.ReLU,
+            output_activation=None,
+        )
 
-        self.time_dim = 8
-        self.max_ep_len = 48
-        self.horizon = 10
+        # DT hyper-parameters
+        self.time_dim = config.time_dim
+        self.max_ep_len = config.max_ep_len
+        self.horizon = config.horizon
         self.state_dim = config.input_state_dim
-        self.action_dim = 1
+        self.action_dim = config.action_dim
         self.scale = config.rtg_scale
-        self.target_return = 1.
         self.state_mean = config.state_mean
         self.state_std = config.state_std
+
+        # Token / DT embeddings
         self.input_timestep_emb_layer = nn.Embedding(self.max_ep_len, self.time_dim)
-        
-        self.input_rtg_emb_layer = ks_mlp(input_size=1, 
-                               hidden_size=[hidden_size, hidden_size], 
-                               output_size=hidden_size, 
-                               output_activation=nn.Identity(), 
-                               hidden_activation=nn.ReLU())
+        self.input_rtg_emb_layer = _build_mlp(1, hidden_size, hidden_size)
+        self.input_state_emb_layer = _build_mlp(self.state_dim, hidden_size, hidden_size)
+        self.input_action_emb_layer = _build_mlp(1, hidden_size, hidden_size)
 
-        self.input_state_emb_layer = ks_mlp(input_size=config.input_state_dim, 
-                               hidden_size=[hidden_size, hidden_size], 
-                               output_size=hidden_size, 
-                               output_activation=nn.Identity(), 
-                               hidden_activation=nn.ReLU())
-        
-        self.input_action_emb_layer = ks_mlp(input_size=1, 
-                               hidden_size=[hidden_size, hidden_size], 
-                               output_size=hidden_size, 
-                               output_activation=nn.Identity(), 
-                               hidden_activation=nn.ReLU())
-        
-        self.trans_rtg_emb = torch.nn.Linear(self.time_dim+hidden_size, hidden_size)
-        self.trans_state_emb = torch.nn.Linear(self.time_dim+hidden_size, hidden_size)
-        self.trans_action_emb = torch.nn.Linear(self.time_dim+hidden_size, hidden_size)
+        # Project (token + time) embeddings into the LLM hidden space.
+        self.trans_rtg_emb = nn.Linear(self.time_dim + hidden_size, hidden_size)
+        self.trans_state_emb = nn.Linear(self.time_dim + hidden_size, hidden_size)
+        self.trans_action_emb = nn.Linear(self.time_dim + hidden_size, hidden_size)
 
-        self.init_eval()
+        self._init_eval_state()
 
-                        
-    @torch.jit.ignore
-    def log(self, msg):
-        logger.warning_once(msg)
-        logger.debug(msg)
-    
-    def forward_Text_RSA_emb(self, states, actions, rtgs, timesteps, attention_mask=None, text_prompt_embs=None):
-        batch_size, seq_len = states.shape[0], states.shape[1]
+    # ------------------------------------------------------------------ #
+    # Forward                                                             #
+    # ------------------------------------------------------------------ #
+    def forward_text_rsa(
+        self,
+        states: torch.Tensor,
+        actions: torch.Tensor,
+        rtgs: torch.Tensor,
+        timesteps: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        text_prompt_embs: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Forward pass through the (text + R/S/A) sequence.
+
+        Returns predicted actions of shape ``(B, K, action_dim)`` and the
+        per-token output embeddings.
+        """
+        batch_size, seq_len = states.shape[:2]
 
         if attention_mask is None:
-            attention_mask = torch.ones((batch_size, seq_length), dtype=torch.long)
-        timestep_emb = self.input_timestep_emb_layer(timesteps)
+            attention_mask = torch.ones((batch_size, seq_len), dtype=torch.long, device=states.device)
 
+        timestep_emb = self.input_timestep_emb_layer(timesteps)
         rtg_emb = self.input_rtg_emb_layer(rtgs)
         state_emb = self.input_state_emb_layer(states)
         action_emb = self.input_action_emb_layer(actions)
-        
-        rtg_emb = torch.cat((rtg_emb, timestep_emb), dim=-1)
-        state_emb = torch.cat((state_emb, timestep_emb), dim=-1)
-        action_emb = torch.cat((action_emb, timestep_emb), dim=-1)
 
-        rtg_emb = self.trans_rtg_emb(rtg_emb)
-        state_emb = self.trans_state_emb(state_emb)
-        action_emb = self.trans_action_emb(action_emb)
+        rtg_emb = self.trans_rtg_emb(torch.cat((rtg_emb, timestep_emb), dim=-1))
+        state_emb = self.trans_state_emb(torch.cat((state_emb, timestep_emb), dim=-1))
+        action_emb = self.trans_action_emb(torch.cat((action_emb, timestep_emb), dim=-1))
 
-        stacked_embs = torch.stack(
-            (rtg_emb, state_emb, action_emb), dim=1
-        ).permute(0, 2, 1, 3).reshape(batch_size, 3 * seq_len, self.hidden_size)
+        # Interleave (R, S, A) along the time axis.
+        stacked_embs = (
+            torch.stack((rtg_emb, state_emb, action_emb), dim=1)
+            .permute(0, 2, 1, 3)
+            .reshape(batch_size, 3 * seq_len, self.hidden_size)
+        )
 
-        stacked_attention_mask = torch.stack(
-            ([attention_mask for _ in range(3)]), dim=1
-        ).permute(0, 2, 1).reshape(batch_size, 3 * seq_len).to(stacked_embs.dtype)
+        if text_prompt_embs is not None:
+            inputs_embeds = torch.cat((text_prompt_embs, stacked_embs), dim=1)
+        else:
+            inputs_embeds = stacked_embs
 
-        text_rsa_emb = torch.concat((text_prompt_embs, stacked_embs), dim=1)
-        
-        outputs = self.model.forward(inputs_embeds=text_rsa_emb)
-
+        outputs = self.model.forward(inputs_embeds=inputs_embeds)
         hidden_states = outputs[0]
 
-        output_embs = hidden_states[:, text_prompt_embs.shape[1]:].reshape(batch_size, seq_len, 3, self.hidden_size).permute(0, 2, 1, 3)
-        output_state_embs = output_embs[:, -2]
-        output = self.output_heads["output_head3"](output_state_embs)  
+        prefix_len = text_prompt_embs.shape[1] if text_prompt_embs is not None else 0
+        rsa_hidden = hidden_states[:, prefix_len:].reshape(batch_size, seq_len, 3, self.hidden_size).permute(0, 2, 1, 3)
+        # index 0=R, 1=S, 2=A; the action prediction is conditioned on the state token (index 1).
+        state_hidden = rsa_hidden[:, 1]
+        pred_actions = self.output_head(state_hidden)
+        return pred_actions, rsa_hidden
 
-        return output, output_embs
+    # ------------------------------------------------------------------ #
+    # Inference utilities                                                 #
+    # ------------------------------------------------------------------ #
+    def _init_eval_state(self) -> None:
+        """Reset the streaming buffers used by :meth:`take_actions`."""
+        self.eval_states = None
+        self.eval_actions = torch.zeros((0, self.action_dim), dtype=torch.float32, device=self.device)
+        self.eval_rewards = torch.zeros(0, dtype=torch.float32, device=self.device)
+        self.eval_target_return: Optional[torch.Tensor] = None
+        self.eval_timesteps = torch.tensor(0, dtype=torch.long, device=self.device).reshape(1, 1)
 
-    def get_action(self, states, actions, returns_to_go, timesteps, **kwargs):
-        states = states.reshape(1, -1, self.state_dim)
-        actions = actions.reshape(1, -1, self.action_dim)
-        returns_to_go = returns_to_go.reshape(1, -1, 1)
-        timesteps = timesteps.reshape(1, -1)
+    def init_eval(self) -> None:
+        """Public alias for resetting the inference state."""
+        self._init_eval_state()
 
-        if self.horizon is not None:
-            states = states[:, -self.horizon:]
-            actions = actions[:, -self.horizon:]
-            returns_to_go = returns_to_go[:, -self.horizon:]
-            timesteps = timesteps[:, -self.horizon:]
+    def organize_rsa_inference(
+        self,
+        state: np.ndarray,
+        pre_reward: Optional[float] = None,
+        target_return: Optional[float] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Append a new state to the eval buffers and pad to ``self.horizon``.
 
-            attention_mask = torch.cat([torch.zeros(self.horizon - states.shape[1]), torch.ones(states.shape[1])])
-            attention_mask = attention_mask.to(dtype=torch.long, device=states.device).reshape(1, -1)
-            states = torch.cat(
-                [torch.zeros((states.shape[0], self.horizon - states.shape[1], self.state_dim),
-                             device=states.device), states],
-                dim=1).to(dtype=torch.float32)
-            actions = torch.cat(
-                [torch.ones((actions.shape[0], self.horizon - actions.shape[1], self.action_dim),
-                             device=actions.device)*(-10.), actions],
-                dim=1).to(dtype=torch.float32)
-            returns_to_go = torch.cat(
-                [torch.zeros((returns_to_go.shape[0], self.horizon - returns_to_go.shape[1], 1),
-                             device=returns_to_go.device), returns_to_go],
-                dim=1).to(dtype=torch.float32)
-            timesteps = torch.cat(
-                [torch.zeros((timesteps.shape[0], self.horizon - timesteps.shape[1]), device=timesteps.device),
-                 timesteps],
-                dim=1).to(device=states.device, dtype=torch.long)
-        else:
-            attention_mask = None
-
-        action_preds, _ = self.forward_w_IO_emb(
-            states=states, actions=actions, rtgs=returns_to_go, timesteps=timesteps, attention_mask=attention_mask)
-        return action_preds[0, -1]
-
-    def take_actions(self, state, target_return=None, pre_reward=None):
-        self.eval()
+        Returns a tuple ``(states, actions, rtgs, timesteps, attention_mask)``
+        ready to be consumed by :meth:`forward_text_rsa`.
+        """
+        device = self.device
         if self.eval_states is None:
-            self.eval_states = torch.from_numpy(state).reshape(1, self.state_dim).to(self.device)
-            ep_return = target_return.to(self.device) if target_return is not None else self.target_return
-            self.eval_target_return = torch.tensor(ep_return, dtype=torch.float32).reshape(1, 1).to(self.device)
-
+            self.eval_states = torch.from_numpy(state).reshape(1, self.state_dim).to(device)
+            ep_return = float(target_return) if target_return is not None else 1.0
+            self.eval_target_return = torch.tensor(ep_return, dtype=torch.float32, device=device).reshape(1, 1)
         else:
-            assert pre_reward is not None
-            cur_state = torch.from_numpy(state).reshape(1, self.state_dim).to(self.device)
-            self.eval_states = torch.cat([self.eval_states, cur_state], dim=0).to(self.device)
-            
-            self.eval_rewards[-1] = pre_reward
+            assert pre_reward is not None, "pre_reward is required after the first step"
+            cur_state = torch.from_numpy(state).reshape(1, self.state_dim).to(device)
+            self.eval_states = torch.cat([self.eval_states, cur_state], dim=0)
 
             pred_return = self.eval_target_return[0, -1] - (pre_reward / self.scale)
             self.eval_target_return = torch.cat([self.eval_target_return, pred_return.reshape(1, 1)], dim=1)
 
-            self.eval_timesteps = self.eval_timesteps.to(self.device)
             self.eval_timesteps = torch.cat(
-                [self.eval_timesteps, torch.ones((1, 1), dtype=torch.long).to(self.device) * self.eval_timesteps[:, -1] + 1], dim=1)
+                [self.eval_timesteps, torch.ones((1, 1), dtype=torch.long, device=device) * self.eval_timesteps[:, -1] + 1],
+                dim=1,
+            )
 
-        self.eval_actions = torch.cat([self.eval_actions.to(self.device), torch.zeros(1, self.action_dim).to(self.device)], dim=0)        
-        self.eval_rewards = torch.cat([self.eval_rewards.to(self.device), torch.zeros(1).to(self.device)])
+        # Append placeholders for the action / reward of the current step.
+        self.eval_actions = torch.cat([self.eval_actions, torch.zeros(1, self.action_dim, device=device)], dim=0)
+        self.eval_rewards = torch.cat([self.eval_rewards, torch.zeros(1, device=device)])
 
-        action = self.get_action(
-            (self.eval_states.to(dtype=torch.float32) - torch.tensor(self.state_mean).to(self.device)) / torch.tensor(self.state_std).to(self.device),
-            self.eval_actions.to(dtype=torch.float32),
-            self.eval_target_return.to(dtype=torch.float32),
-            self.eval_timesteps.to(dtype=torch.long),
-        )
-        self.eval_actions[-1] = action
-        action = action.item()
-        return action
+        states = self.eval_states.reshape(1, -1, self.state_dim).float()
+        actions = self.eval_actions.reshape(1, -1, self.action_dim).float()
+        rtgs = self.eval_target_return.reshape(1, -1, 1).float()
+        timesteps = self.eval_timesteps.reshape(1, -1).long()
 
-    def init_eval(self):
-        self.eval_states = None
-        self.eval_actions = torch.zeros((0, self.action_dim), dtype=torch.float32).to(self.device)
-        self.eval_rewards = torch.zeros(0, dtype=torch.float32).to(self.device)
-        self.eval_costs = torch.zeros(0, dtype=torch.float32).to(self.device)
+        # Normalise state.
+        state_mean = torch.as_tensor(self.state_mean, dtype=torch.float32, device=device)
+        state_std = torch.as_tensor(self.state_std, dtype=torch.float32, device=device)
+        states = (states - state_mean) / state_std
 
-        self.eval_target_return = None
-        self.eval_target_ctg = None
+        # Truncate / pad to the policy horizon.
+        h = self.horizon
+        states = states[:, -h:]
+        actions = actions[:, -h:]
+        rtgs = rtgs[:, -h:]
+        timesteps = timesteps[:, -h:]
 
-        self.eval_timesteps = torch.tensor(0, dtype=torch.long).reshape(1, 1).to(self.device)
+        cur_len = states.shape[1]
+        pad = h - cur_len
+        attention_mask = torch.cat(
+            [torch.zeros(pad, dtype=torch.long, device=device), torch.ones(cur_len, dtype=torch.long, device=device)]
+        ).reshape(1, -1)
 
-        self.eval_episode_return, self.eval_episode_length = 0, 0
+        if pad > 0:
+            states = torch.cat([torch.zeros((1, pad, self.state_dim), device=device), states], dim=1)
+            actions = torch.cat(
+                [torch.full((1, pad, self.action_dim), ACTION_PADDING_VALUE, device=device), actions], dim=1,
+            )
+            rtgs = torch.cat([torch.zeros((1, pad, 1), device=device), rtgs], dim=1)
+            timesteps = torch.cat([torch.zeros((1, pad), dtype=torch.long, device=device), timesteps], dim=1)
+
+        return states, actions, rtgs, timesteps, attention_mask

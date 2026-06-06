@@ -1,45 +1,56 @@
-
 <h1 align="center">
-  <img src="figs/kuaishou_tech.png" alt="Kuaishou Logo" width="150" height="40"><br>
-  LBM: Hierarchical Large Auto-Bidding Model
-via Reasoning and Acting
+  LBM: Hierarchical Large Auto-Bidding Model<br>via Reasoning and Acting
 </h1>
 
-
 <p align="center">
-  <a href="https://arxiv.org/pdf/2603.05134"><img src="https://img.shields.io/badge/📖_Paper-WWW'26-red" alt="Paper WWW'25"></a>
+  <a href="https://arxiv.org/"><img src="https://img.shields.io/badge/📖_Paper-WWW'26-red" alt="Paper WWW'26"></a>
+  <img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License">
 </p>
 
 ## 📝 Introduction
-We propose a hierarchical Large auto-Bidding
-Model (LBM) to leverage the reasoning capabilities of LLMs for developing a superior auto-bidding strategy, including a high-level LBM-Think model for reasoning and a low-level LBM-Act model for action generation. 
+
+We propose a hierarchical Large auto-Bidding Model (**LBM**) that leverages the
+reasoning capabilities of LLMs to develop a superior auto-bidding strategy.
+LBM is composed of two coordinated modules:
+
+- **LBM-Think**: a high-level model that performs Chain-of-Thought (CoT)
+  reasoning and produces a directional guide for bid adjustment.
+- **LBM-Act**: a low-level model that, conditioned on the high-level guide,
+  the return-to-go (RTG) and the current state, generates the bidding parameter.
 
 <p align="center">
-    <img src="./figs/main.png" alt="method" width="1000" height="300">
-   <img src="./figs/inference.png" alt="method" width="1000" height="650">
+    <img src="./figs/main.png" alt="method overview" width="1000">
+    <img src="./figs/inference.png" alt="inference pipeline" width="1000">
 </p>
-
-
 
 ## 💾 Installation
 
-This codebase is relying on AuctionNet and Llama-Factory.
-### Python Environment
-```
-conda create -n lbm python=3.9
-# install vllm
-pip3 install vllm==0.6.3
-# flash attention 2
-pip3 install flash-attn --no-build-isolation
-# quality of life
-pip install wandb IPython matplotlib
+This codebase is built on top of [AuctionNet](https://tianchi.aliyun.com/competition/entrance/532236/rankingList)
+and [LLaMA-Factory](https://github.com/hiyouga/LLaMA-Factory).
+
+### Python environment
+
+```bash
+conda create -n lbm python=3.9 -y
+conda activate lbm
+
+# core dependencies
+pip install -r requirements.txt
+
+# optional: flash attention 2 (requires CUDA toolchain)
+pip install flash-attn --no-build-isolation
 ```
 
-### Prepare the Datasets
-The datasets could be downloaded from the [NeurIPS 2024 Competition Auto-Bidding in Large-Scale Auctions (AIGB dataset, which is preprocessed from the AuctionNet vanilla data by Alibaba)](https://tianchi.aliyun.com/competition/entrance/532236/rankingList).
-We express our utmost respect for their tremendous contributions to the auto-bidding and computational advertising community!
-#### 1) AuctionNet Dataset
-```
+### Prepare the datasets
+
+The datasets can be downloaded from
+[NeurIPS 2024 — Auto-Bidding in Large-Scale Auctions (AIGB Track, preprocessed from AuctionNet by Alibaba)](https://tianchi.aliyun.com/competition/entrance/532236/rankingList).
+We express our utmost respect for their tremendous contributions to the
+auto-bidding and computational advertising community.
+
+#### 1) AuctionNet (dense)
+
+```text
 https://alimama-bidding-competition.oss-cn-beijing.aliyuncs.com/share/autoBidding_aigb_track_data_period_7-8.zip
 https://alimama-bidding-competition.oss-cn-beijing.aliyuncs.com/share/autoBidding_aigb_track_data_period_9-10.zip
 https://alimama-bidding-competition.oss-cn-beijing.aliyuncs.com/share/autoBidding_aigb_track_data_period_11-12.zip
@@ -49,8 +60,9 @@ https://alimama-bidding-competition.oss-cn-beijing.aliyuncs.com/share/autoBiddin
 https://alimama-bidding-competition.oss-cn-beijing.aliyuncs.com/share/autoBidding_aigb_track_data_trajectory_data_extended_2.zip
 ```
 
-#### 2) AuctionNet-sparse Dataset
-```
+#### 2) AuctionNet-sparse
+
+```text
 https://alimama-bidding-competition.oss-cn-beijing.aliyuncs.com/share/final/autoBidding_aigb_track_final_data_period_7-8.zip
 https://alimama-bidding-competition.oss-cn-beijing.aliyuncs.com/share/final/autoBidding_aigb_track_final_data_period_9-10.zip
 https://alimama-bidding-competition.oss-cn-beijing.aliyuncs.com/share/final/autoBidding_aigb_track_final_data_period_11-12.zip
@@ -60,61 +72,119 @@ https://alimama-bidding-competition.oss-cn-beijing.aliyuncs.com/share/final/auto
 https://alimama-bidding-competition.oss-cn-beijing.aliyuncs.com/share/final/autoBidding_aigb_track_final_data_trajectory_data_3.zip
 ```
 
-## 🚀 Get Started 
-### Step 1: Guidance for Training the LBM-Act
-In current industrial auto-bidding practice like Kuaishou, the auto-bidding model generates a bidding parameter $\alpha$, which takes effect through the formula $\text{bid}_{i} = \alpha \times \text{CPA} \times \text{pCTCVR}_{i}$, where CPA is the cost-per-action target set by the advertiser reflecting their desired cost for each conversion, and $\text{pCTCVR}_{i}$ is the estimated conversion probability of the advertiser's campaign for impression opportunity $i$. 
-The bidding parameter $\alpha$ is frequently adjusted by the model to influence auction ranking outcomes, with the objective of maximizing the advertiser's total conversion value subject to KPI constraints.
+## 🚀 Get Started
 
+### Step 1 — Train LBM-Act
 
-Previously, auto-bidding models have been trained in a black-box manner using methods such as IQL and Decision Transformer. However, we observe that these approaches can exhibit counterintuitive behavior: when a campaign is clearly under-spending (i.e., the realized cost-per-action is far below the advertiser's target), the auto-bidding model may still fail to increase---or may even decrease---the bidding parameter, missing opportunities to acquire more conversions. Symmetrically, when a campaign is over-spending, the model may fail to lower the bidding parameter accordingly. 
-In other words, these black-box methods sometimes violate fundamental bidding principles, resulting in suboptimal delivery performance and tangible economic loss for advertisers.
+In current industrial auto-bidding practice (e.g. Kuaishou), the auto-bidding
+model produces a bidding parameter $\alpha$, which is applied through
+$\text{bid}_i = \alpha \times \text{CPA} \times \text{pCTCVR}_i$, where CPA is
+the cost-per-action target set by the advertiser and $\text{pCTCVR}_i$ is the
+estimated conversion probability for impression opportunity $i$. The objective
+is to maximize the advertiser's total conversion value while satisfying KPI
+constraints.
 
-Inspired from DT's success in learning the mapping: (RTG, State) --> Action, we propose learn a LBM-Act by learning: (High_Level_Guide, RTG, State) --> Action, where High_Level_Guide is generated from the LLM's reasoning.
-We consider a simple setting with three high-level guide:  "increasing the bidding parameter", " decreasing the bidding parameter", and "uncertain about the optimal adjustment direction".
-You could also extend it to more complex ones according to the industrial pracice.
-To train an LBM-Act model that could well follows such high level guide just like follow the RTG, we need to make sure the guide is not contradict to the action.
+Black-box methods such as IQL and Decision Transformer can exhibit
+counter-intuitive behavior: when a campaign is clearly *under-spending* (the
+realized CPA is far below target), the model may still fail to *increase*
+$\alpha$, missing conversions; symmetrically, *over-spending* may not lead to
+a decrease. This results in suboptimal delivery and tangible economic loss.
 
-For training the LBM-Act, run:
+Inspired by DT's success in learning the mapping `(RTG, State) -> Action`, we
+train **LBM-Act** to learn `(High_Level_Guide, RTG, State) -> Action`, where
+`High_Level_Guide` is generated by an LLM's reasoning. Three coarse-grained
+guides are supported out of the box:
+
+- *increase* the bidding parameter,
+- *decrease* the bidding parameter,
+- *uncertain* about the optimal direction.
+
+You can easily extend the guide vocabulary for industrial practice. A key
+constraint is that the guide must not contradict the supervised action.
+
+To train LBM-Act:
+
 ```bash
-cd openLBM
-
-python lbm_act/train_lbm_act.py \
-    --data_path /path/to/your/data \
+python -m lbm_act.train_lbm_act \
+    --data_path /path/to/preprocessed/data \
     --outputs_path ./ckpt \
     --sparse_data
 ```
 
-The backbone LLM is `Qwen/Qwen2.5-0.5B-Instruct`, which will be automatically downloaded from HuggingFace upon first run.
-After Successfully run, you can get output like this:
+The backbone LLM defaults to `Qwen/Qwen2.5-0.5B-Instruct` and is downloaded
+automatically from HuggingFace on first run. After a successful run you should
+see logs similar to:
+
 ![alt text](figs/lbm_act_log.png)
 
+### Step 2 — Train LBM-Think
 
+Once LBM-Act is able to follow the high-level guide, the next step is to train
+**LBM-Think** to *produce* effective high-level guidance. Public LLMs have not
+been exposed to industrial bidding logs and therefore lack understanding of
+the auto-bidding task. They are prone to hallucination, which directly hurts
+LBM-Act downstream.
 
+We address this with **GQPO**: given the same prompt we sample multiple
+Chain-of-Thought (CoT) responses, filter out hallucinated candidates, and use
+a Q-value function to keep only CoTs whose induced action attains a higher
+state-action Q-value than the dataset action. The selected high-quality CoTs
+are used for supervised fine-tuning.
 
+1) Generate the prompt data:
 
+```bash
+python lbm_think/gen_prompt_data/bidding_data.py \
+    --local_dir /path/to/AuctionNet \
+    --save_dir  /path/to/save/prompt
+```
 
-### Step 2: Guidance for Training the LBM-Think
-Once the LBM-Act module has been trained to follow high-level guidance, the next step is to train LBM-Think to produce effective high-level guidance by leveraging the reasoning capabilities of the LLM. However, publicly available LLMs have not been exposed to industrial bidding logs, and consequently lack an understanding of the auto-bidding task, its domain-specific input features, and operational context. As a result, they are prone to hallucination, and such unreliable reasoning can degrade the downstream performance of LBM-Act.
+You can revise the prompt template in
+`lbm_think/gen_prompt_data/bidding_template.py`.
 
-To address this challenge, we propose the GQPO method. Specifically, given the same prompt, we first let the LLM generate multiple Chain-of-Thought (CoT) responses. We then filter out hallucinated responses that contain logically inconsistent or factually incorrect reasoning. Among the remaining valid candidates, we employ a Q-value function to evaluate which CoT (high-level guidance) leads to an action with a higher state-action Q-value compared to the label action (bidding parameter $\alpha$). The selected high-quality CoTs are then used for supervised fine-tuning to reinforce and internalize this improved reasoning pattern within the LLM.
+2) Generate GQPO data with a Q-value critic:
 
-First, we need to generate prompt data, by `python lbm_think/gen_prompt_data/bidding_data.py`.
-You can also revise the prompt template in `lbm_think/gen_prompt_data/bidding_template.py`.
-After successfully run, you will get output like this:
-![alt text](figs/bidding_data_log.png)
+```bash
+python lbm_think/generate_gqpo_dataset.py \
+    --train_data_path /path/to/save/prompt/train.parquet \
+    --cot_llm_path    Qwen/Qwen2.5-3B-Instruct \
+    --Q_path          /path/to/Q-net/checkpoint \
+    --llm_act_path    /path/to/lbm_act/final.pt \
+    --save_data_path  ./training_data.jsonl
+```
 
+A Q-value function is required for this step; one can be trained following
+[GAS_WWW-25](https://github.com/yewen99/GAS_WWW-25) (`run/train_dt_critics.py`).
 
+3) Run SFT through LLaMA-Factory:
 
-Then, run `python lbm_think/generate_gqpo_dataset.py` to generate the data by GQPO method. (You need to train a Q-value function before this step, like using `python run/train_dt_critics.py` from https://github.com/yewen99/GAS_WWW-25)
-
-
-
-Finally, do SFT via Llama-factory: 
 ```bash
 llamafactory-cli train lbm_think/train_full/qwen2_5_full_sft_dense.yaml
 ```
 
+### Step 3 — Evaluation
 
+```bash
+python evaluate/run_evaluate.py \
+    --policy_load_dir  /path/to/lbm_act/final.pt \
+    --test_file_path   /path/to/period-7.csv \
+    [--sparse_data] [--llm_gen_cot --cot_llm_path /path/to/lbm_think] \
+    [--use_Q_voting --Q_paths /path/to/Q1 /path/to/Q2]
+```
 
-### Step 3: Evaluation
-For evaluation, run `python evaluate/run_evaluate.py`.
+## 📂 Project Layout
+
+```text
+openLBM/
+├── lbm_act/                  # LBM-Act training (low-level action model)
+├── lbm_think/                # LBM-Think (high-level reasoner) + GQPO + SFT configs
+│   ├── gen_prompt_data/
+│   ├── train_full/           # LLaMA-Factory YAML configs
+│   └── src/llamafactory/     # bundled LLaMA-Factory source
+└── evaluate/                 # offline evaluation on AuctionNet
+    └── bidding_train_env/
+```
+
+## 📜 License
+
+This project is released under the MIT License. See [LICENSE](LICENSE).

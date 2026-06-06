@@ -1,105 +1,87 @@
-import pandas as pd
+"""Shared preprocessing utilities used by the offline-evaluation pipeline."""
+
+from __future__ import annotations
+
 import os
 import pickle
+from typing import Iterable
+
 import numpy as np
+import pandas as pd
 
 
-def normalize_state(training_data, state_dim, normalize_indices):
+_EPS = 1e-10
+
+
+def normalize_state(training_data: pd.DataFrame, state_dim: int, normalize_indices: Iterable[int]):
+    """Min-max normalise selected dimensions of state / next_state in-place.
+
+    Parameters
+    ----------
+    training_data:
+        DataFrame with ``state`` and ``next_state`` columns containing tuples
+        of length ``state_dim``.
+    state_dim:
+        Total dimensionality of each state vector.
+    normalize_indices:
+        Indices of the state dimensions that should be min-max normalised.
+
+    Returns
+    -------
+    dict
+        Per-dimension normalisation statistics for the requested indices.
     """
-    Normalize features for reinforcement learning.
-    Args:
-        training_data: A DataFrame containing the training data.
-        state_dim: The total dimension of the features.
-        normalize_indices: A list of indices of the features to be normalized.
+    normalize_indices = list(normalize_indices)
+    state_columns = [f"state{i}" for i in range(state_dim)]
+    next_state_columns = [f"next_state{i}" for i in range(state_dim)]
 
-    Returns:
-        A dictionary containing the normalization statistics.
-    """
-    state_columns = [f'state{i}' for i in range(state_dim)]
-    next_state_columns = [f'next_state{i}' for i in range(state_dim)]
-
-    for i, (state_col, next_state_col) in enumerate(zip(state_columns, next_state_columns)):
-        training_data[state_col] = training_data['state'].apply(
-            lambda x: x[i] if x is not None and not np.isnan(x).any() else 0.0)
-        training_data[next_state_col] = training_data['next_state'].apply(
-            lambda x: x[i] if x is not None and not np.isnan(x).any() else 0.0)
+    for i, (s_col, ns_col) in enumerate(zip(state_columns, next_state_columns)):
+        training_data[s_col] = training_data["state"].apply(
+            lambda x, i=i: x[i] if x is not None and not np.isnan(x).any() else 0.0
+        )
+        training_data[ns_col] = training_data["next_state"].apply(
+            lambda x, i=i: x[i] if x is not None and not np.isnan(x).any() else 0.0
+        )
 
     stats = {
         i: {
-            'min': training_data[state_columns[i]].min(),
-            'max': training_data[state_columns[i]].max(),
-            'mean': training_data[state_columns[i]].mean(),
-            'std': training_data[state_columns[i]].std()
+            "min": training_data[state_columns[i]].min(),
+            "max": training_data[state_columns[i]].max(),
+            "mean": training_data[state_columns[i]].mean(),
+            "std": training_data[state_columns[i]].std(),
         }
         for i in normalize_indices
     }
 
-    for state_col, next_state_col in zip(state_columns, next_state_columns):
-        if int(state_col.replace('state', '')) in normalize_indices:
-            min_val = stats[int(state_col.replace('state', ''))]['min']
-            max_val = stats[int(state_col.replace('state', ''))]['max']
-            training_data[f'normalize_{state_col}'] = (
-                                                              training_data[state_col] - min_val) / (
-                                                              max_val - min_val + 1e-10)
-            training_data[f'normalize_{next_state_col}'] = (
-                                                                   training_data[next_state_col] - min_val) / (
-                                                                   max_val - min_val + 1e-10)
-            # 0.01 error too large?
+    for s_col, ns_col in zip(state_columns, next_state_columns):
+        idx = int(s_col.replace("state", ""))
+        if idx in normalize_indices:
+            mn, mx = stats[idx]["min"], stats[idx]["max"]
+            training_data[f"normalize_{s_col}"] = (training_data[s_col] - mn) / (mx - mn + _EPS)
+            training_data[f"normalize_{ns_col}"] = (training_data[ns_col] - mn) / (mx - mn + _EPS)
         else:
-            training_data[f'normalize_{state_col}'] = training_data[state_col]
-            training_data[f'normalize_{next_state_col}'] = training_data[next_state_col]
+            training_data[f"normalize_{s_col}"] = training_data[s_col]
+            training_data[f"normalize_{ns_col}"] = training_data[ns_col]
 
-    training_data['normalize_state'] = training_data.apply(
-        lambda row: tuple(row[f'normalize_{state_col}'] for state_col in state_columns), axis=1)
-    training_data['normalize_nextstate'] = training_data.apply(
-        lambda row: tuple(row[f'normalize_{next_state_col}'] for next_state_col in next_state_columns), axis=1)
-
+    training_data["normalize_state"] = training_data.apply(
+        lambda row: tuple(row[f"normalize_{c}"] for c in state_columns), axis=1
+    )
+    training_data["normalize_nextstate"] = training_data.apply(
+        lambda row: tuple(row[f"normalize_{c}"] for c in next_state_columns), axis=1
+    )
     return stats
 
 
-def normalize_reward(training_data, reward_type):
-    """
-    Normalize rewards for reinforcement learning.
-
-    Args:
-        training_data: A DataFrame containing the training data.
-        reward_type: reward:sparse reward   reward_continuous: continuous reward
-
-    Returns:
-        A Series of normalized rewards.
-    """
-    reward_range = training_data[reward_type].max() - training_data[reward_type].min() + 0.00000001
-    training_data["normalize_reward"] = (
-                                                training_data[reward_type] - training_data[
-                                            reward_type].min()) / reward_range
+def normalize_reward(training_data: pd.DataFrame, reward_type: str = "reward") -> pd.Series:
+    """Min-max normalise the ``reward_type`` column of ``training_data``."""
+    column = training_data[reward_type]
+    span = column.max() - column.min() + _EPS
+    training_data["normalize_reward"] = (column - column.min()) / span
     return training_data["normalize_reward"]
 
 
-def save_normalize_dict(normalize_dict, save_dir):
-    """
-    Save the normalization dictionary to a Pickle file.
-
-    Args:
-        normalize_dict: The dictionary containing normalization statistics.
-        save_dir: The directory to save the normalization dictionary.
-    """
-    if not os.path.exists(save_dir):
-        os.makedirs(save_dir)
-    save_path = os.path.join(save_dir, 'normalize_dict.pkl')
-    with open(save_path, 'wb') as file:
-        pickle.dump(normalize_dict, file)
-
-
-if __name__ == '__main__':
-    test_data = {
-        'state': [(1, 2, 3), (4, 5, 6), (7, 8, 9)],
-        'next_state': [(2, 3, 4), (5, 6, 7), (8, 9, 10)],
-        'reward': [10, 20, 30]
-    }
-    training_data = pd.DataFrame(test_data)
-    state_dim = 3
-    normalize_indices = [0, 2]
-    stats = normalize_state(training_data, state_dim, normalize_indices)
-    normalize_reward(training_data)
-    print(training_data)
-    print(stats)
+def save_normalize_dict(normalize_dict: dict, save_dir: str) -> None:
+    """Pickle a normalisation dictionary to ``save_dir/normalize_dict.pkl``."""
+    os.makedirs(save_dir, exist_ok=True)
+    with open(os.path.join(save_dir, "normalize_dict.pkl"), "wb") as f:
+        pickle.dump(normalize_dict, f)

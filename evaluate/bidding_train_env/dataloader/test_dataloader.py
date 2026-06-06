@@ -1,75 +1,59 @@
+"""Offline-evaluation data loader.
+
+Adapted from
+https://github.com/alimama-tech/NeurIPS_Auto_Bidding_AIGB_Track_Baseline.
 """
-    Directly Use the Code from https://github.com/alimama-tech/NeurIPS_Auto_Bidding_AIGB_Track_Baseline.git
-"""
+
+from __future__ import annotations
+
 import os
-import numpy as np
-import pandas as pd
 import pickle
 import warnings
 
-warnings.filterwarnings('ignore')
+import numpy as np
+import pandas as pd
+
+
+warnings.filterwarnings("ignore")
 
 
 class TestDataLoader:
-    """
-    Offline evaluation data loader.
-    """
+    """Load AuctionNet evaluation traffic and group it by (period, advertiser)."""
 
-    def __init__(self, file_path="./data/log.csv"):
-        """
-        Initialize the data loader.
-        Args:
-            file_path (str): The path to the training data file.
-
-        """
+    def __init__(self, file_path: str = "./data/log.csv"):
         self.file_path = file_path
         self.raw_data_path = os.path.join(os.path.dirname(file_path), "raw_data.pickle")
         self.raw_data = self._get_raw_data()
         self.keys, self.test_dict = self._get_test_data_dict()
 
-    def _get_raw_data(self):
-        """
-        Read raw data from a pickle file.
-
-        Returns:
-            pd.DataFrame: The raw data as a DataFrame.
-        """
+    def _get_raw_data(self) -> pd.DataFrame:
+        """Read raw data from a pickle cache, regenerating it from CSV if missing."""
         if os.path.exists(self.raw_data_path):
-            with open(self.raw_data_path, 'rb') as file:
-                return pickle.load(file)
-        else:
-            tem = pd.read_csv(self.file_path)
-            with open(self.raw_data_path, 'wb') as file:
-                pickle.dump(tem, file)
-            return tem
+            with open(self.raw_data_path, "rb") as f:
+                return pickle.load(f)
+
+        df = pd.read_csv(self.file_path)
+        with open(self.raw_data_path, "wb") as f:
+            pickle.dump(df, f)
+        return df
 
     def _get_test_data_dict(self):
-        """
-        Group and sort the raw data by deliveryPeriodIndex and advertiserNumber.
-
-        Returns:
-            list: A list of group keys.
-            dict: A dictionary with grouped data.
-
-        """
-        grouped_data = self.raw_data.sort_values('timeStepIndex').groupby(['deliveryPeriodIndex', 'advertiserNumber'])
-        data_dict = {key: group for key, group in grouped_data}
+        """Group raw data by ``(deliveryPeriodIndex, advertiserNumber)``."""
+        grouped = self.raw_data.sort_values("timeStepIndex").groupby(
+            ["deliveryPeriodIndex", "advertiserNumber"]
+        )
+        data_dict = {key: group for key, group in grouped}
         return list(data_dict.keys()), data_dict
 
     def mock_data(self, key):
-        """
-        Get training data based on deliveryPeriodIndex and advertiserNumber, and construct the test data.
-        """
+        """Build the test inputs for a single advertiser/period."""
         data = self.test_dict[key]
-        pValues = data.groupby('timeStepIndex')['pValue'].apply(list).apply(np.array).tolist()
-        pValueSigmas = data.groupby('timeStepIndex')['pValueSigma'].apply(list).apply(np.array).tolist()
-        leastWinningCosts = data.groupby('timeStepIndex')['leastWinningCost'].apply(list).apply(np.array).tolist()
-        num_timeStepIndex = len(pValues)
-        budget = data['budget'].iloc[0]
-        cpa = data['CPAConstraint'].iloc[0]
-        category = data['advertiserCategoryIndex'].iloc[0]
-        return num_timeStepIndex, pValues, pValueSigmas, leastWinningCosts, budget, cpa, category
+        p_values = data.groupby("timeStepIndex")["pValue"].apply(list).apply(np.array).tolist()
+        p_value_sigmas = data.groupby("timeStepIndex")["pValueSigma"].apply(list).apply(np.array).tolist()
+        least_winning_costs = data.groupby("timeStepIndex")["leastWinningCost"].apply(list).apply(np.array).tolist()
 
-
-if __name__ == '__main__':
-    pass
+        num_time_steps = len(p_values)
+        budget = data["budget"].iloc[0]
+        cpa = data["CPAConstraint"].iloc[0]
+        category = data["advertiserCategoryIndex"].iloc[0]
+        return num_time_steps, p_values, p_value_sigmas, least_winning_costs, budget, cpa, category

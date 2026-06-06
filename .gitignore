@@ -1,10 +1,28 @@
+# Python
 __pycache__/
-*.pyc
-*.pyo
+*.py[cod]
+*.egg-info/
+*.so
+.eggs/
+build/
+dist/
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
+
+# Model artefacts and logs
 *.pt
 *.pth
-*.egg-info/
-wandb/
 ckpt/
+saves/
+wandb/
 *.log
 events.out.tfevents.*
+
+# Data
+data/
+*.parquet
+*.npy
+raw_data.pickle
